@@ -47,6 +47,9 @@ DEV_GROUP_ID = int(os.environ.get("DEV_GROUP_ID", "0")) or None  # developer con
 FEATURED_PRICE_CEDIS = 500
 FEATURED_DAYS = 30  # default tier; multi-tier can be added later
 
+PREMIUM_PRICE_CEDIS = 500   # one-time payment to remove the free listing cap
+FREE_BOT_LIMIT = 2          # max *bot* listings a non-premium user can have live at once
+
 DATA_DIR = "/data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -105,7 +108,10 @@ def get_user(uid: int) -> dict:
     users = load_json(USERS_FILE)
     key = str(uid)
     if key not in users:
-        users[key] = {"uid": uid, "lang": "en", "joined": datetime.now().isoformat(), "tos_accepted": False}
+        users[key] = {
+            "uid": uid, "lang": "en", "joined": datetime.now().isoformat(),
+            "tos_accepted": False, "premium": False,
+        }
         save_json(USERS_FILE, users)
     return users[key]
 
@@ -113,6 +119,14 @@ def save_user(u: dict):
     users = load_json(USERS_FILE)
     users[str(u["uid"])] = u
     save_json(USERS_FILE, users)
+
+def is_premium(uid: int) -> bool:
+    return get_user(uid).get("premium", False)
+
+def set_premium(uid: int):
+    u = get_user(uid)
+    u["premium"] = True
+    save_user(u)
 
 def set_tos_accepted(uid: int):
     u = get_user(uid)
@@ -215,6 +229,20 @@ def owner_listings(owner_id: int) -> List[dict]:
     listings = load_json(LISTINGS_FILE)
     return [l for l in listings.values() if l["owner_id"] == owner_id]
 
+def count_active_bots(owner_id: int) -> int:
+    """How many bot listings (not removed) this user currently owns —
+    used to enforce the free-tier cap."""
+    return len([l for l in owner_listings(owner_id) if l["type"] == "bot" and l["status"] != "removed"])
+
+def bot_limit_reached(uid: int) -> bool:
+    return (not is_premium(uid)) and count_active_bots(uid) >= FREE_BOT_LIMIT
+
+def premium_upsell_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🚀 Go Premium — GHS {PREMIUM_PRICE_CEDIS} (unlimited bots)", callback_data="go_premium")],
+        [InlineKeyboardButton("◀ Back", callback_data="home")],
+    ])
+
 def report_listing(lid: str):
     update_listing(lid, status="reported")
 
@@ -264,17 +292,21 @@ def featured(listing_type: str) -> List[dict]:
 
 PAYSTACK_BASE = "https://api.paystack.co"
 
-async def create_payment_request(uid: int, lid: str, email: str) -> dict:
+async def create_payment_request(uid: int, lid: Optional[str], email: str,
+                                    purpose: str = "feature", amount: Optional[int] = None) -> dict:
     """Creates a pending payment record. If PAYSTACK_SECRET is set, calls
     Paystack's initialize-transaction endpoint and stores the real checkout
     URL + reference. If not set (or the call fails), falls back to manual
     confirmation via /confirmpay.
+    purpose: "feature" (boosts one listing, needs lid) or "premium" (account-wide
+    upgrade removing the free listing cap, lid is None).
     """
+    amount = amount or (PREMIUM_PRICE_CEDIS if purpose == "premium" else FEATURED_PRICE_CEDIS)
     payments = load_json(PAYMENTS_FILE)
     pid = new_listing_id()
     record = {
-        "id": pid, "uid": uid, "listing_id": lid,
-        "amount_cedis": FEATURED_PRICE_CEDIS, "status": "pending_manual_confirmation",
+        "id": pid, "uid": uid, "listing_id": lid, "purpose": purpose,
+        "amount_cedis": amount, "status": "pending_manual_confirmation",
         "created": datetime.now().isoformat(),
         "checkout_url": None, "paystack_reference": None,
     }
@@ -287,10 +319,10 @@ async def create_payment_request(uid: int, lid: str, email: str) -> dict:
                     headers={"Authorization": f"Bearer {PAYSTACK_SECRET}"},
                     json={
                         "email": email,
-                        "amount": FEATURED_PRICE_CEDIS * 100,  # Paystack uses kobo/pesewas (smallest unit)
+                        "amount": amount * 100,  # Paystack uses kobo/pesewas (smallest unit)
                         "currency": "GHS",
                         "reference": pid,
-                        "metadata": {"uid": uid, "listing_id": lid, "purpose": "featured_listing"},
+                        "metadata": {"uid": uid, "listing_id": lid, "purpose": purpose},
                     },
                 )
                 data = r.json()
@@ -326,16 +358,23 @@ async def verify_paystack_payment(pid: str) -> bool:
         logging.error(f"Paystack verify error: {e}")
     return False
 
-def confirm_payment_and_feature(pid: str):
+def confirm_payment(pid: str) -> Optional[str]:
+    """Marks a payment confirmed and applies its effect. Returns the purpose
+    string ("feature" or "premium") on success, or None if the payment id
+    doesn't exist."""
     payments = load_json(PAYMENTS_FILE)
     p = payments.get(pid)
     if not p:
-        return False
+        return None
     p["status"] = "confirmed"
     save_json(PAYMENTS_FILE, payments)
-    until = (datetime.now() + timedelta(days=FEATURED_DAYS)).isoformat()
-    update_listing(p["listing_id"], featured_until=until)
-    return True
+    purpose = p.get("purpose", "feature")
+    if purpose == "premium":
+        set_premium(p["uid"])
+    else:
+        until = (datetime.now() + timedelta(days=FEATURED_DAYS)).isoformat()
+        update_listing(p["listing_id"], featured_until=until)
+    return purpose
 
 # ════════════════════════════════════════════════════════════════════════════
 # MENUS
@@ -423,6 +462,13 @@ async def cmd_getchatid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ════════════════════════════════════════════════════════════════════════════
 
 async def begin_add_flow(uid: int, listing_type: str, ctx: ContextTypes.DEFAULT_TYPE, message):
+    if listing_type == "bot" and bot_limit_reached(uid):
+        await message.reply_text(
+            f"🚫 Free accounts can list up to {FREE_BOT_LIMIT} bots, and you're at that limit.\n"
+            f"Go Premium for a one-time GHS {PREMIUM_PRICE_CEDIS} to add unlimited bots.",
+            reply_markup=premium_upsell_keyboard()
+        )
+        return
     if listing_type in ("group", "channel") and not has_accepted_tos(uid):
         await message.reply_text(
             t("en", "tos_warning"), parse_mode="Markdown", reply_markup=tos_keyboard()
@@ -472,7 +518,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not lid or "@" not in text:
             await update.message.reply_text("That doesn't look like a valid email. Please try again from My Listings.")
             return
-        payment = await create_payment_request(uid, lid, email=text)
+        payment = await create_payment_request(uid, lid, email=text, purpose="feature")
         if payment.get("checkout_url"):
             pay_kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("💳 Pay Now", url=payment["checkout_url"])]
@@ -496,6 +542,41 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     await ctx.bot.send_message(
                         ADMIN_ID,
                         f"⚠️ Paystack checkout failed for ref {payment['id']}, user {uid}, listing {lid}. "
+                        f"Manual confirm: /confirmpay {payment['id']}"
+                    )
+                except Exception as e:
+                    logging.error(f"Admin alert failed: {e}")
+        return
+
+    if mode == "premium_email":
+        ctx.user_data["mode"] = None
+        if "@" not in text:
+            await update.message.reply_text("That doesn't look like a valid email. Please try again with 🚀 Go Premium.")
+            return
+        payment = await create_payment_request(uid, None, email=text, purpose="premium")
+        if payment.get("checkout_url"):
+            pay_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("💳 Pay Now", url=payment["checkout_url"])]
+            ])
+            await update.message.reply_text(
+                f"🚀 *Go Premium — GHS {PREMIUM_PRICE_CEDIS}*\n"
+                f"Reference: `{payment['id']}`\n\n"
+                f"Tap below to pay securely via Paystack. This link is unique to this request — "
+                f"your free-tier bot limit is lifted automatically once payment clears.",
+                parse_mode="Markdown", reply_markup=pay_kb
+            )
+        else:
+            await update.message.reply_text(
+                f"🚀 *Premium Upgrade Requested*\nReference: `{payment['id']}`\n\n"
+                f"Online checkout couldn't be reached right now. Contact the admin with this "
+                f"reference to complete payment manually.",
+                parse_mode="Markdown"
+            )
+            if ADMIN_ID:
+                try:
+                    await ctx.bot.send_message(
+                        ADMIN_ID,
+                        f"⚠️ Paystack checkout failed for premium ref {payment['id']}, user {uid}. "
                         f"Manual confirm: /confirmpay {payment['id']}"
                     )
                 except Exception as e:
@@ -623,6 +704,14 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ADD LISTING (from section menu)
     if data.startswith("add_"):
         ltype = data.split("_", 1)[1]
+        if ltype == "bot" and bot_limit_reached(uid):
+            await query.answer()
+            await query.edit_message_text(
+                f"🚫 Free accounts can list up to {FREE_BOT_LIMIT} bots, and you're at that limit.\n"
+                f"Go Premium for a one-time GHS {PREMIUM_PRICE_CEDIS} to add unlimited bots.",
+                reply_markup=premium_upsell_keyboard()
+            )
+            return
         if ltype in ("group", "channel") and not has_accepted_tos(uid):
             await query.answer()
             await query.edit_message_text(
@@ -837,16 +926,29 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("📂 Browse by category — choose a section:", reply_markup=kb)
         return
 
-    # FEATURE INFO + payment stub
+    # FEATURE INFO — now actionable: list the user's own listings to feature directly
     if data == "feature_info":
         await query.answer()
-        await query.edit_message_text(
+        mine = [l for l in owner_listings(uid) if l["status"] != "removed"]
+        rows = []
+        for l in mine:
+            tag = "👑 " if l.get("featured_until") and l["featured_until"] > datetime.now().isoformat() else ""
+            rows.append([InlineKeyboardButton(
+                f"{tag}{l['title']} ({l['type']})"[:64], callback_data=f"requestfeature_{l['id']}"
+            )])
+        rows.append([InlineKeyboardButton(
+            f"🚀 Go Premium — GHS {PREMIUM_PRICE_CEDIS} (unlimited bots)", callback_data="go_premium"
+        )])
+        rows.append([InlineKeyboardButton("◀ Back", callback_data="home")])
+        intro = (
             f"👑 *Get Featured*\n"
             f"GHS {FEATURED_PRICE_CEDIS} for {FEATURED_DAYS} days at the top of your category + homepage rotation.\n\n"
-            f"To feature a listing, open it from *My Listings* and tap 👑 Feature This.\n"
-            f"_Note: online card payment isn't fully wired yet — you'll get manual payment instructions for now._",
-            parse_mode="Markdown", reply_markup=main_menu()
         )
+        if mine:
+            intro += "Pick a listing below to feature it:"
+        else:
+            intro += "You don't have any listings yet — add one first from the main menu."
+        await query.edit_message_text(intro, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
         return
 
     if data.startswith("requestfeature_"):
@@ -862,14 +964,14 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
             return
-        payment = await create_payment_request(uid, lid, email="")
+        payment = await create_payment_request(uid, lid, email="", purpose="feature")
         await query.answer("Feature request created — see payment instructions.", show_alert=True)
         await query.edit_message_text(
             f"👑 *Feature Request Created*\n"
             f"Amount: GHS {FEATURED_PRICE_CEDIS}\n"
             f"Reference: `{payment['id']}`\n\n"
-            f"Online payment isn't live yet. Please contact the admin to complete payment manually, "
-            f"quoting this reference. You'll be featured as soon as it's confirmed.",
+            f"Online payment isn't configured yet (no PAYSTACK_SECRET set). Please contact the admin to "
+            f"complete payment manually, quoting this reference. You'll be featured as soon as it's confirmed.",
             parse_mode="Markdown", reply_markup=main_menu()
         )
         if ADMIN_ID:
@@ -877,6 +979,42 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await ctx.bot.send_message(
                     ADMIN_ID,
                     f"💰 Feature payment requested\nRef: {payment['id']}\nUser: {uid}\nListing: {lid}\n"
+                    f"Confirm manually with /confirmpay {payment['id']}"
+                )
+            except Exception as e:
+                logging.error(f"Admin payment alert failed: {e}")
+        return
+
+    # GO PREMIUM — account-wide upgrade removing the free bot-listing cap
+    if data == "go_premium":
+        await query.answer()
+        if is_premium(uid):
+            await query.edit_message_text("🚀 You're already Premium — enjoy unlimited bot listings!",
+                                            reply_markup=main_menu())
+            return
+        if PAYSTACK_SECRET:
+            ctx.user_data["mode"] = "premium_email"
+            await query.edit_message_text(
+                f"🚀 *Go Premium — GHS {PREMIUM_PRICE_CEDIS}*\n"
+                f"One-time payment, removes the {FREE_BOT_LIMIT}-bot free limit forever.\n\n"
+                "Send the email address to use for the payment receipt:",
+                parse_mode="Markdown"
+            )
+            return
+        payment = await create_payment_request(uid, None, email="", purpose="premium")
+        await query.edit_message_text(
+            f"🚀 *Premium Upgrade Requested*\n"
+            f"Amount: GHS {PREMIUM_PRICE_CEDIS}\n"
+            f"Reference: `{payment['id']}`\n\n"
+            f"Online payment isn't configured yet (no PAYSTACK_SECRET set). Please contact the admin to "
+            f"complete payment manually, quoting this reference.",
+            parse_mode="Markdown", reply_markup=main_menu()
+        )
+        if ADMIN_ID:
+            try:
+                await ctx.bot.send_message(
+                    ADMIN_ID,
+                    f"💰 Premium upgrade requested\nRef: {payment['id']}\nUser: {uid}\n"
                     f"Confirm manually with /confirmpay {payment['id']}"
                 )
             except Exception as e:
@@ -953,10 +1091,38 @@ async def cmd_confirmpay(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-    ok = confirm_payment_and_feature(pid)
-    await update.message.reply_text("✅ Confirmed and featured." if ok else "❌ Payment ID not found.")
-    if ok:
+    purpose = confirm_payment(pid)
+    if not purpose:
+        await update.message.reply_text("❌ Payment ID not found.")
+        return
+
+    payments = load_json(PAYMENTS_FILE)
+    payer_uid = payments.get(pid, {}).get("uid")
+
+    if purpose == "premium":
+        await update.message.reply_text("✅ Confirmed — user upgraded to Premium (unlimited bot listings).")
+        await log_event(ctx, f"💰 *Payment confirmed*: `{pid}` → Premium upgrade for `{payer_uid}`")
+        if payer_uid:
+            try:
+                await ctx.bot.send_message(
+                    payer_uid,
+                    "🚀 *You're Premium now!*\nYour bot listing limit has been removed — add as many as you like.",
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logging.warning(f"Premium confirm DM failed: {e}")
+    else:
+        await update.message.reply_text("✅ Confirmed and featured.")
         await log_event(ctx, f"💰 *Payment confirmed*: `{pid}` → featured for {FEATURED_DAYS} days")
+        if payer_uid:
+            try:
+                await ctx.bot.send_message(
+                    payer_uid,
+                    f"👑 *Payment confirmed!*\nYour listing is now featured for {FEATURED_DAYS} days.",
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logging.warning(f"Feature confirm DM failed: {e}")
 
 # ════════════════════════════════════════════════════════════════════════════
 # MAIN
