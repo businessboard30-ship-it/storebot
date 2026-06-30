@@ -308,7 +308,7 @@ async def create_payment_request(uid: int, lid: Optional[str], email: str,
         "id": pid, "uid": uid, "listing_id": lid, "purpose": purpose,
         "amount_cedis": amount, "status": "pending_manual_confirmation",
         "created": datetime.now().isoformat(),
-        "checkout_url": None, "paystack_reference": None,
+        "checkout_url": None, "paystack_reference": None, "init_error": None,
     }
 
     if PAYSTACK_SECRET:
@@ -331,9 +331,13 @@ async def create_payment_request(uid: int, lid: Optional[str], email: str,
                     record["paystack_reference"] = data["data"]["reference"]
                     record["status"] = "pending_paystack"
                 else:
+                    record["init_error"] = data.get("message") or f"HTTP {r.status_code}"
                     logging.warning(f"Paystack init failed: {data}")
         except Exception as e:
+            record["init_error"] = str(e)
             logging.error(f"Paystack init error: {e}")
+    else:
+        record["init_error"] = "PAYSTACK_SECRET is not set on this deployment."
 
     payments[pid] = record
     save_json(PAYMENTS_FILE, payments)
@@ -531,17 +535,19 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown", reply_markup=pay_kb
             )
         else:
+            reason = payment.get("init_error") or "Unknown error"
             await update.message.reply_text(
                 f"👑 *Feature Request Created*\nReference: `{payment['id']}`\n\n"
-                f"Online checkout couldn't be reached right now. Contact the admin with this "
-                f"reference to complete payment manually.",
+                f"⚠️ Online checkout couldn't be started: _{esc(reason)}_\n"
+                f"Contact the admin with this reference to complete payment manually.",
                 parse_mode="Markdown"
             )
             if ADMIN_ID:
                 try:
                     await ctx.bot.send_message(
                         ADMIN_ID,
-                        f"⚠️ Paystack checkout failed for ref {payment['id']}, user {uid}, listing {lid}. "
+                        f"⚠️ Paystack checkout failed for ref {payment['id']}, user {uid}, listing {lid}.\n"
+                        f"Reason: {reason}\n"
                         f"Manual confirm: /confirmpay {payment['id']}"
                     )
                 except Exception as e:
@@ -566,17 +572,19 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown", reply_markup=pay_kb
             )
         else:
+            reason = payment.get("init_error") or "Unknown error"
             await update.message.reply_text(
                 f"🚀 *Premium Upgrade Requested*\nReference: `{payment['id']}`\n\n"
-                f"Online checkout couldn't be reached right now. Contact the admin with this "
-                f"reference to complete payment manually.",
+                f"⚠️ Online checkout couldn't be started: _{esc(reason)}_\n"
+                f"Contact the admin with this reference to complete payment manually.",
                 parse_mode="Markdown"
             )
             if ADMIN_ID:
                 try:
                     await ctx.bot.send_message(
                         ADMIN_ID,
-                        f"⚠️ Paystack checkout failed for premium ref {payment['id']}, user {uid}. "
+                        f"⚠️ Paystack checkout failed for premium ref {payment['id']}, user {uid}.\n"
+                        f"Reason: {reason}\n"
                         f"Manual confirm: /confirmpay {payment['id']}"
                     )
                 except Exception as e:
@@ -945,9 +953,13 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"GHS {FEATURED_PRICE_CEDIS} for {FEATURED_DAYS} days at the top of your category + homepage rotation.\n\n"
         )
         if mine:
-            intro += "Pick a listing below to feature it:"
+            intro += "Pick a listing below to feature it, or go Premium for unlimited bots:"
         else:
-            intro += "You don't have any listings yet — add one first from the main menu."
+            intro += (
+                "You don't have a listing to feature yet — add one from the main menu first.\n\n"
+                "That's only for *Get Featured*, though — Premium below doesn't need a listing, "
+                "it just removes your free bot-listing cap:"
+            )
         await query.edit_message_text(intro, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
         return
 
