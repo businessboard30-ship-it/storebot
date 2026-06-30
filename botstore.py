@@ -474,12 +474,15 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         payment = await create_payment_request(uid, lid, email=text)
         if payment.get("checkout_url"):
+            pay_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("💳 Pay Now", url=payment["checkout_url"])]
+            ])
             await update.message.reply_text(
                 f"👑 *Get Featured — GHS {FEATURED_PRICE_CEDIS}*\n"
                 f"Reference: `{payment['id']}`\n\n"
-                f"[Tap here to pay securely via Paystack]({payment['checkout_url']})\n\n"
-                f"You'll be featured automatically once payment is confirmed.",
-                parse_mode="Markdown", disable_web_page_preview=True
+                f"Tap below to pay securely via Paystack. This link is unique to this "
+                f"request and your listing will be featured automatically once payment clears.",
+                parse_mode="Markdown", reply_markup=pay_kb
             )
         else:
             await update.message.reply_text(
