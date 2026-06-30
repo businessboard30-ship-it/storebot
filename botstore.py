@@ -57,6 +57,7 @@ CLICKS_FILE = os.path.join(DATA_DIR, "clicks.json")
 PAYMENTS_FILE = os.path.join(DATA_DIR, "payments.json")
 
 LISTING_TYPES = ["bot", "group", "channel"]
+PAGE_SIZE = 5  # listings per page when browsing
 
 CATEGORIES = [
     "Finance", "Games", "Utility", "AI & Productivity", "Education",
@@ -125,6 +126,28 @@ def has_accepted_tos(uid: int) -> bool:
 
 def new_listing_id() -> str:
     return uuid.uuid4().hex[:10]
+
+def to_url(identifier: str) -> str:
+    """Turns a stored identifier (@username, t.me/xxx, or full link) into a
+    tappable https://t.me/... URL suitable for an inline URL button."""
+    ident = (identifier or "").strip()
+    if ident.startswith("http://") or ident.startswith("https://"):
+        return ident
+    if ident.startswith("t.me/"):
+        return f"https://{ident}"
+    if ident.startswith("@"):
+        ident = ident[1:]
+    return f"https://t.me/{ident}"
+
+def esc(text: str) -> str:
+    """Escapes legacy-Markdown special characters in user-supplied text
+    (titles, descriptions, identifiers) before it goes into a parse_mode
+    'Markdown' message, so a stray _ * ` or [ in a listing can't break
+    message rendering."""
+    text = "" if text is None else str(text)
+    for ch in ("\\", "_", "*", "`", "["):
+        text = text.replace(ch, "\\" + ch)
+    return text
 
 async def log_event(ctx: ContextTypes.DEFAULT_TYPE, text: str):
     """Posts an activity record to the dedicated log group, if configured.
@@ -348,17 +371,9 @@ def tos_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("◀ Cancel", callback_data="home")],
     ])
 
-def listing_card_keyboard(lid: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⭐ Rate", callback_data=f"rate_{lid}"),
-         InlineKeyboardButton("📤 Share", callback_data=f"share_{lid}")],
-        [InlineKeyboardButton("🚩 Report", callback_data=f"report_{lid}")],
-        [InlineKeyboardButton("◀ Back", callback_data="home")],
-    ])
-
 def stars_keyboard(lid: str) -> InlineKeyboardMarkup:
     row = [InlineKeyboardButton("⭐" * n, callback_data=f"star_{lid}_{n}") for n in range(1, 6)]
-    return InlineKeyboardMarkup([row, [InlineKeyboardButton("◀ Back", callback_data="home")]])
+    return InlineKeyboardMarkup([row, [InlineKeyboardButton("◀ Cancel", callback_data=f"backview_{lid}")]])
 
 # ════════════════════════════════════════════════════════════════════════════
 # COMMAND HANDLERS
@@ -490,25 +505,94 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not results:
             await update.message.reply_text("No results found. Try a different keyword.")
             return
-        await send_listing_results(update.message, results[:10])
+        await send_listing_results(update.message, results, ctx, header=f"🔍 Results for \"{text}\"", back="home")
         return
 
     # Fallback
     await update.message.reply_text("Use /start to open the menu.")
 
-async def send_listing_results(message, results: List[dict]):
-    for l in results:
-        avg = get_avg_rating(l["id"])
-        rating_str = f"⭐ {avg}/5" if avg else "⭐ No ratings yet"
-        featured_tag = "👑 FEATURED\n" if l.get("featured_until") and l["featured_until"] > datetime.now().isoformat() else ""
-        msg = (
-            f"{featured_tag}*{l['title']}* ({l['type'].title()})\n"
-            f"{l['identifier']}\n"
-            f"_{l['description']}_\n"
-            f"{rating_str} · 👁 {get_clicks(l['id'])} views · 📂 {l['category']}"
-        )
-        record_click(l["id"])
-        await message.reply_text(msg, parse_mode="Markdown", reply_markup=listing_card_keyboard(l["id"]))
+async def send_listing_results(target, results: List[dict], ctx: ContextTypes.DEFAULT_TYPE,
+                                 header: str = "Results", back: str = "home", edit: bool = False):
+    """Stores the result set in user_data and renders page 1 as a tappable list.
+    `target` is a Message (edit=False) or a CallbackQuery (edit=True)."""
+    ctx.user_data["browse"] = {
+        "lids": [l["id"] for l in results],
+        "page": 0,
+        "header": header,
+        "back": back,
+    }
+    await render_browse_page(target, ctx, edit=edit)
+
+async def render_browse_page(target, ctx: ContextTypes.DEFAULT_TYPE, edit: bool = True):
+    """Renders the current page of ctx.user_data['browse'] as a tappable list
+    with Prev/Next pagination and a 'Get Featured' ad button. `target` is
+    either a Message (edit=False, sends new) or a CallbackQuery (edit=True)."""
+    browse = ctx.user_data.get("browse")
+    if not browse or not browse["lids"]:
+        text = "Nothing here yet."
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀ Back", callback_data=(browse or {}).get("back", "home"))]])
+        if edit:
+            await target.edit_message_text(text, reply_markup=kb)
+        else:
+            await target.reply_text(text, reply_markup=kb)
+        return
+
+    lids = browse["lids"]
+    total_pages = max(1, (len(lids) + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(browse["page"], total_pages - 1))
+    browse["page"] = page
+    chunk = lids[page * PAGE_SIZE: page * PAGE_SIZE + PAGE_SIZE]
+
+    listings = load_json(LISTINGS_FILE)
+    rows = []
+    for lid in chunk:
+        l = listings.get(lid)
+        if not l:
+            continue
+        avg = get_avg_rating(lid)
+        rating_str = f"⭐{avg}" if avg else "⭐–"
+        tag = "👑 " if l.get("featured_until") and l["featured_until"] > datetime.now().isoformat() else ""
+        label = f"{tag}{l['title']} ({l['type']}) · {rating_str}"
+        rows.append([InlineKeyboardButton(label[:64], callback_data=f"view_{lid}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀ Prev", callback_data="page_prev"))
+    nav.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("Next ▶", callback_data="page_next"))
+    rows.append(nav)
+
+    rows.append([InlineKeyboardButton("👑 Get Featured — promote your listing", callback_data="feature_info")])
+    rows.append([InlineKeyboardButton("◀ Back", callback_data=browse.get("back", "home"))])
+
+    text = f"{browse.get('header', 'Results')}\nShowing {len(lids)} result(s) · page {page + 1}/{total_pages}"
+    kb = InlineKeyboardMarkup(rows)
+    if edit:
+        await target.edit_message_text(text, reply_markup=kb)
+    else:
+        await target.reply_text(text, reply_markup=kb)
+
+def detail_card_text(l: dict) -> str:
+    avg = get_avg_rating(l["id"])
+    rating_str = f"⭐ {avg}/5" if avg else "⭐ No ratings yet"
+    featured_tag = "👑 FEATURED\n" if l.get("featured_until") and l["featured_until"] > datetime.now().isoformat() else ""
+    return (
+        f"{featured_tag}*{esc(l['title'])}*\n"
+        f"📂 {esc(l['category'])} · {esc(l['type'].title())}\n"
+        f"{rating_str} · 👁 {get_clicks(l['id'])} views\n\n"
+        f"_{esc(l['description'])}_\n\n"
+        f"`{esc(l['identifier'])}`"
+    )
+
+def detail_card_keyboard(lid: str, identifier: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📲 Open", url=to_url(identifier))],
+        [InlineKeyboardButton("⭐ Rate", callback_data=f"rate_{lid}"),
+         InlineKeyboardButton("📤 Share", callback_data=f"share_{lid}")],
+        [InlineKeyboardButton("🚩 Report", callback_data=f"report_{lid}")],
+        [InlineKeyboardButton("◀ Back to list", callback_data="browse_back")],
+    ])
 
 # ════════════════════════════════════════════════════════════════════════════
 # CALLBACK HANDLER
@@ -574,7 +658,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["adding"] = None
         await query.answer("🎉 Listing submitted and live!", show_alert=True)
         await query.edit_message_text(
-            f"✅ *{entry['title']}* added to the {entry['type']} directory under *{category}*.\n"
+            f"✅ *{esc(entry['title'])}* added to the {entry['type']} directory under *{esc(category)}*.\n"
             f"It's live now. Want more visibility? Get Featured from the main menu.",
             parse_mode="Markdown", reply_markup=main_menu()
         )
@@ -582,14 +666,14 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             try:
                 await ctx.bot.send_message(
                     ADMIN_ID,
-                    f"🆕 New {entry['type']} listing: *{entry['title']}*\n"
-                    f"{entry['identifier']}\nCategory: {category}\nBy user: {uid}\n"
+                    f"🆕 New {entry['type']} listing: *{esc(entry['title'])}*\n"
+                    f"{esc(entry['identifier'])}\nCategory: {esc(category)}\nBy user: {uid}\n"
                     f"Please check it follows the rules.",
                     parse_mode="Markdown"
                 )
             except Exception as e:
                 logging.error(f"Admin alert failed: {e}")
-        await log_event(ctx, f"🆕 *Listing*: {entry['title']} ({entry['type']}) by `{uid}` — {category}")
+        await log_event(ctx, f"🆕 *Listing*: {esc(entry['title'])} ({entry['type']}) by `{uid}` — {esc(category)}")
         return
 
     # TRENDING / TOP RATED / FEATURED / CATEGORY LIST
@@ -598,19 +682,26 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         kind, ltype = data.split("_", 1)
         if kind == "trend":
             results = trending(ltype)
+            header = f"🔥 Trending {ltype}s"
         elif kind == "top":
             results = top_rated(ltype)
+            header = f"⭐ Top rated {ltype}s"
         elif kind == "feat":
             results = featured(ltype)
+            header = f"👑 Featured {ltype}s"
         else:
-            cat_buttons = [[InlineKeyboardButton(c, callback_data=f"catpick_{ltype}_{c}")] for c in CATEGORIES]
-            await query.edit_message_text("Choose a category:", reply_markup=InlineKeyboardMarkup(cat_buttons))
+            cat_buttons = []
+            for c in CATEGORIES:
+                n = len(list_by_type(ltype, c))
+                cat_buttons.append([InlineKeyboardButton(f"{c} ({n})", callback_data=f"catpick_{ltype}_{c}")])
+            cat_buttons.append([InlineKeyboardButton("◀ Back", callback_data=f"sec_{ltype}")])
+            await query.edit_message_text(f"📂 *{ltype.title()}s by category:*", parse_mode="Markdown",
+                                            reply_markup=InlineKeyboardMarkup(cat_buttons))
             return
         if not results:
             await query.edit_message_text("Nothing here yet.", reply_markup=section_menu(ltype))
             return
-        await query.edit_message_text(f"Showing {len(results)} result(s):")
-        await send_listing_results(query.message, results)
+        await send_listing_results(query, results, ctx, header=header, back=f"sec_{ltype}", edit=True)
         return
 
     if data.startswith("catpick_"):
@@ -620,8 +711,63 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not results:
             await query.edit_message_text("No listings in this category yet.", reply_markup=section_menu(ltype))
             return
-        await query.edit_message_text(f"📂 {category} — {len(results)} result(s):")
-        await send_listing_results(query.message, results)
+        await send_listing_results(query, results, ctx, header=f"📂 {category} {ltype}s", back=f"catlist_{ltype}", edit=True)
+        return
+
+    # VIEW DETAIL CARD (tapped a listing from a list page) — counts as a view
+    if data.startswith("view_"):
+        lid = data.split("_", 1)[1]
+        l = get_listing(lid)
+        if not l:
+            await query.answer("Listing not found.", show_alert=True)
+            return
+        await query.answer()
+        record_click(lid)
+        await log_event(ctx, f"👁 *View*: {esc(l['title'])} (`{esc(l['identifier'])}`) by `{uid}`")
+        await query.edit_message_text(
+            detail_card_text(l), parse_mode="Markdown",
+            reply_markup=detail_card_keyboard(lid, l["identifier"])
+        )
+        return
+
+    # Redisplay detail card without counting a new view (e.g. cancelling a rating)
+    if data.startswith("backview_"):
+        lid = data.split("_", 1)[1]
+        l = get_listing(lid)
+        if not l:
+            await query.answer("Listing not found.", show_alert=True)
+            return
+        await query.answer()
+        await query.edit_message_text(
+            detail_card_text(l), parse_mode="Markdown",
+            reply_markup=detail_card_keyboard(lid, l["identifier"])
+        )
+        return
+
+    # PAGINATION
+    if data == "page_prev":
+        await query.answer()
+        browse = ctx.user_data.get("browse")
+        if browse:
+            browse["page"] = max(0, browse["page"] - 1)
+        await render_browse_page(query, ctx, edit=True)
+        return
+
+    if data == "page_next":
+        await query.answer()
+        browse = ctx.user_data.get("browse")
+        if browse:
+            browse["page"] = browse["page"] + 1
+        await render_browse_page(query, ctx, edit=True)
+        return
+
+    if data == "browse_back":
+        await query.answer()
+        await render_browse_page(query, ctx, edit=True)
+        return
+
+    if data == "noop":
+        await query.answer()
         return
 
     # RATE
@@ -636,8 +782,12 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         add_rating(lid, uid, int(n))
         await query.answer(f"Thanks! You rated it {n}⭐", show_alert=True)
         l = get_listing(lid)
-        title = l["title"] if l else lid
-        await log_event(ctx, f"⭐ *Rating*: {title} rated {n}/5 by `{uid}`")
+        if l:
+            await log_event(ctx, f"⭐ *Rating*: {esc(l['title'])} rated {n}/5 by `{uid}`")
+            await query.edit_message_text(
+                detail_card_text(l), parse_mode="Markdown",
+                reply_markup=detail_card_keyboard(lid, l["identifier"])
+            )
         return
 
     # SHARE
@@ -672,12 +822,16 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🔍 Type a name or keyword to search:")
         return
 
-    # CATEGORIES (top-level browse)
+    # CATEGORIES (top-level browse) — choose section first
     if data == "cats":
         await query.answer()
-        cat_buttons = [[InlineKeyboardButton(c, callback_data=f"catpick_bot_{c}")] for c in CATEGORIES]
-        await query.edit_message_text("Browsing Bots by category (switch section for Groups/Channels):",
-                                        reply_markup=InlineKeyboardMarkup(cat_buttons))
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🤖 Bots", callback_data="catlist_bot")],
+            [InlineKeyboardButton("👥 Groups", callback_data="catlist_group")],
+            [InlineKeyboardButton("📢 Channels", callback_data="catlist_channel")],
+            [InlineKeyboardButton("◀ Back", callback_data="home")],
+        ])
+        await query.edit_message_text("📂 Browse by category — choose a section:", reply_markup=kb)
         return
 
     # FEATURE INFO + payment stub
@@ -740,7 +894,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("◀ Back", callback_data="home")],
             ])
             await query.message.reply_text(
-                f"*{l['title']}* ({l['type']})\n{l['identifier']}\nStatus: {l['status']}",
+                f"*{esc(l['title'])}* ({l['type']})\n{esc(l['identifier'])}\nStatus: {l['status']}",
                 parse_mode="Markdown", reply_markup=kb
             )
         return
