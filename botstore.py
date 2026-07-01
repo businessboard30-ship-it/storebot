@@ -37,6 +37,7 @@ logging.basicConfig(level=logging.INFO)
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 PAYSTACK_SECRET = os.environ.get("PAYSTACK_SECRET")  # not live yet — manual fallback used
+PAYMENT_RECEIPT_EMAIL = os.environ.get("PAYMENT_RECEIPT_EMAIL", "customer@botstore.app")
 
 # Set these AFTER you create the groups, by getting their chat IDs (forward a
 # message from each group to @userinfobot, or use /getlogid /getdevid below
@@ -384,6 +385,40 @@ def confirm_payment(pid: str) -> Optional[str]:
         update_listing(p["listing_id"], featured_until=until)
     return purpose
 
+async def run_payment_flow(query, ctx: ContextTypes.DEFAULT_TYPE, uid: int,
+                             lid: Optional[str], purpose: str, price: int, label: str):
+    """One-tap payment flow, no email prompt, no 'request created' text:
+    tap -> '⏳ Generating your payment link…' -> Pay Now + Verify card.
+    `label` is the human title shown on the card, e.g. 'Get Featured' / 'Go Premium'.
+    """
+    await query.answer()
+    await query.edit_message_text("⏳ Generating your payment link…")
+    payment = await create_payment_request(uid, lid, email=PAYMENT_RECEIPT_EMAIL, purpose=purpose)
+    if payment.get("checkout_url"):
+        pay_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"💳 Pay GHS {price}", url=payment["checkout_url"])],
+            [InlineKeyboardButton("✅ I've Paid — Verify", callback_data=f"verifypay_{payment['id']}")],
+        ])
+        await query.message.reply_text(
+            f"🛒 {label}\n\n"
+            f"Tap Pay to complete payment securely via Paystack.\n"
+            f"Then tap I've Paid — Verify to confirm. 🎉",
+            reply_markup=pay_kb
+        )
+    else:
+        reason = payment.get("init_error") or "Unknown error"
+        await query.message.reply_text("⚠️ Payment setup failed. Please try again in a moment.")
+        if ADMIN_ID:
+            try:
+                await ctx.bot.send_message(
+                    ADMIN_ID,
+                    f"⚠️ Paystack checkout failed\nPurpose: {purpose}\nRef: {payment['id']}\n"
+                    f"User: {uid}\nListing: {lid}\nReason: {reason}\n"
+                    f"Manual confirm: /confirmpay {payment['id']}"
+                )
+            except Exception as e:
+                logging.error(f"Admin payment alert failed: {e}")
+
 # ════════════════════════════════════════════════════════════════════════════
 # MENUS
 # ════════════════════════════════════════════════════════════════════════════
@@ -518,76 +553,6 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "Choose a category:", reply_markup=InlineKeyboardMarkup(cat_buttons)
             )
             return
-
-    if mode == "feature_email":
-        lid = ctx.user_data.get("pending_feature_lid")
-        ctx.user_data["mode"] = None
-        ctx.user_data["pending_feature_lid"] = None
-        if not lid or "@" not in text:
-            await update.message.reply_text("That doesn't look like a valid email. Please try again from My Listings.")
-            return
-        generating_msg = await update.message.reply_text("⏳ Generating your payment link…")
-        payment = await create_payment_request(uid, lid, email=text, purpose="feature")
-        await generating_msg.delete()
-        if payment.get("checkout_url"):
-            pay_kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("💳 Pay Now", url=payment["checkout_url"])],
-                [InlineKeyboardButton("✅ I've Paid — Verify", callback_data=f"verifypay_{payment['id']}")],
-            ])
-            await update.message.reply_text(
-                f"👑 *Get Featured — GHS {FEATURED_PRICE_CEDIS}*\n\n"
-                f"Tap *Pay Now* to complete payment securely via Paystack.\n"
-                f"Then tap *I've Paid — Verify* to confirm. 🎉",
-                parse_mode="Markdown", reply_markup=pay_kb
-            )
-        else:
-            reason = payment.get("init_error") or "Unknown error"
-            await update.message.reply_text("⚠️ Payment setup failed. Please try again in a moment.")
-            if ADMIN_ID:
-                try:
-                    await ctx.bot.send_message(
-                        ADMIN_ID,
-                        f"⚠️ Paystack checkout failed for ref {payment['id']}, user {uid}, listing {lid}.\n"
-                        f"Reason: {reason}\n"
-                        f"Manual confirm: /confirmpay {payment['id']}"
-                    )
-                except Exception as e:
-                    logging.error(f"Admin alert failed: {e}")
-        return
-
-    if mode == "premium_email":
-        ctx.user_data["mode"] = None
-        if "@" not in text:
-            await update.message.reply_text("That doesn't look like a valid email. Please try again with 🚀 Go Premium.")
-            return
-        generating_msg = await update.message.reply_text("⏳ Generating your payment link…")
-        payment = await create_payment_request(uid, None, email=text, purpose="premium")
-        await generating_msg.delete()
-        if payment.get("checkout_url"):
-            pay_kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("💳 Pay Now", url=payment["checkout_url"])],
-                [InlineKeyboardButton("✅ I've Paid — Verify", callback_data=f"verifypay_{payment['id']}")],
-            ])
-            await update.message.reply_text(
-                f"🚀 *Go Premium — GHS {PREMIUM_PRICE_CEDIS}*\n\n"
-                f"Tap *Pay Now* to complete payment securely via Paystack.\n"
-                f"Then tap *I've Paid — Verify* to confirm. 🎉",
-                parse_mode="Markdown", reply_markup=pay_kb
-            )
-        else:
-            reason = payment.get("init_error") or "Unknown error"
-            await update.message.reply_text("⚠️ Payment setup failed. Please try again in a moment.")
-            if ADMIN_ID:
-                try:
-                    await ctx.bot.send_message(
-                        ADMIN_ID,
-                        f"⚠️ Paystack checkout failed for premium ref {payment['id']}, user {uid}.\n"
-                        f"Reason: {reason}\n"
-                        f"Manual confirm: /confirmpay {payment['id']}"
-                    )
-                except Exception as e:
-                    logging.error(f"Admin alert failed: {e}")
-        return
 
     if mode == "search_all":
         results = search_listings(text)
@@ -963,72 +928,17 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("requestfeature_"):
         lid = data.split("_", 1)[1]
-        if PAYSTACK_SECRET:
-            ctx.user_data["pending_feature_lid"] = lid
-            ctx.user_data["mode"] = "feature_email"
-            await query.answer()
-            await query.edit_message_text(
-                "👑 *Get Featured*\n"
-                f"GHS {FEATURED_PRICE_CEDIS} for {FEATURED_DAYS} days.\n\n"
-                "Send the email address to use for the payment receipt:",
-                parse_mode="Markdown"
-            )
-            return
-        payment = await create_payment_request(uid, lid, email="", purpose="feature")
-        await query.answer("Feature request created — see payment instructions.", show_alert=True)
-        await query.edit_message_text(
-            f"👑 *Feature Request Created*\n"
-            f"Amount: GHS {FEATURED_PRICE_CEDIS}\n"
-            f"Reference: `{payment['id']}`\n\n"
-            f"Online payment isn't configured yet (no PAYSTACK_SECRET set). Please contact the admin to "
-            f"complete payment manually, quoting this reference. You'll be featured as soon as it's confirmed.",
-            parse_mode="Markdown", reply_markup=main_menu()
-        )
-        if ADMIN_ID:
-            try:
-                await ctx.bot.send_message(
-                    ADMIN_ID,
-                    f"💰 Feature payment requested\nRef: {payment['id']}\nUser: {uid}\nListing: {lid}\n"
-                    f"Confirm manually with /confirmpay {payment['id']}"
-                )
-            except Exception as e:
-                logging.error(f"Admin payment alert failed: {e}")
+        await run_payment_flow(query, ctx, uid, lid, "feature", FEATURED_PRICE_CEDIS, "Get Featured")
         return
 
     # GO PREMIUM — account-wide upgrade removing the free bot-listing cap
     if data == "go_premium":
-        await query.answer()
         if is_premium(uid):
+            await query.answer()
             await query.edit_message_text("🚀 You're already Premium — enjoy unlimited bot listings!",
                                             reply_markup=main_menu())
             return
-        if PAYSTACK_SECRET:
-            ctx.user_data["mode"] = "premium_email"
-            await query.edit_message_text(
-                f"🚀 *Go Premium — GHS {PREMIUM_PRICE_CEDIS}*\n"
-                f"One-time payment, removes the {FREE_BOT_LIMIT}-bot free limit forever.\n\n"
-                "Send the email address to use for the payment receipt:",
-                parse_mode="Markdown"
-            )
-            return
-        payment = await create_payment_request(uid, None, email="", purpose="premium")
-        await query.edit_message_text(
-            f"🚀 *Premium Upgrade Requested*\n"
-            f"Amount: GHS {PREMIUM_PRICE_CEDIS}\n"
-            f"Reference: `{payment['id']}`\n\n"
-            f"Online payment isn't configured yet (no PAYSTACK_SECRET set). Please contact the admin to "
-            f"complete payment manually, quoting this reference.",
-            parse_mode="Markdown", reply_markup=main_menu()
-        )
-        if ADMIN_ID:
-            try:
-                await ctx.bot.send_message(
-                    ADMIN_ID,
-                    f"💰 Premium upgrade requested\nRef: {payment['id']}\nUser: {uid}\n"
-                    f"Confirm manually with /confirmpay {payment['id']}"
-                )
-            except Exception as e:
-                logging.error(f"Admin payment alert failed: {e}")
+        await run_payment_flow(query, ctx, uid, None, "premium", PREMIUM_PRICE_CEDIS, "Go Premium")
         return
 
     # SELF-SERVE PAYMENT VERIFICATION ("I've Paid — Verify")
