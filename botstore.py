@@ -316,12 +316,16 @@ async def create_payment_request(uid: int, lid: Optional[str], email: str,
             async with httpx.AsyncClient(timeout=15) as c:
                 r = await c.post(
                     f"{PAYSTACK_BASE}/transaction/initialize",
-                    headers={"Authorization": f"Bearer {PAYSTACK_SECRET}"},
+                    headers={
+                        "Authorization": f"Bearer {PAYSTACK_SECRET}",
+                        "Content-Type": "application/json",
+                    },
                     json={
                         "email": email,
                         "amount": amount * 100,  # Paystack uses kobo/pesewas (smallest unit)
                         "currency": "GHS",
-                        "reference": pid,
+                        "reference": pid,  # must match our internal id — verify_paystack_payment()
+                                            # and /confirmpay both look up Paystack by this pid
                         "metadata": {"uid": uid, "listing_id": lid, "purpose": purpose},
                     },
                 )
@@ -525,13 +529,14 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         payment = await create_payment_request(uid, lid, email=text, purpose="feature")
         if payment.get("checkout_url"):
             pay_kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("💳 Pay Now", url=payment["checkout_url"])]
+                [InlineKeyboardButton("💳 Pay Now", url=payment["checkout_url"])],
+                [InlineKeyboardButton("✅ I've Paid — Verify", callback_data=f"verifypay_{payment['id']}")],
             ])
             await update.message.reply_text(
                 f"👑 *Get Featured — GHS {FEATURED_PRICE_CEDIS}*\n"
                 f"Reference: `{payment['id']}`\n\n"
-                f"Tap below to pay securely via Paystack. This link is unique to this "
-                f"request and your listing will be featured automatically once payment clears.",
+                f"Tap *Pay Now* to pay securely via Paystack, then tap *I've Paid — Verify* "
+                f"to confirm right away — no need to wait on us.",
                 parse_mode="Markdown", reply_markup=pay_kb
             )
         else:
@@ -562,13 +567,14 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         payment = await create_payment_request(uid, None, email=text, purpose="premium")
         if payment.get("checkout_url"):
             pay_kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("💳 Pay Now", url=payment["checkout_url"])]
+                [InlineKeyboardButton("💳 Pay Now", url=payment["checkout_url"])],
+                [InlineKeyboardButton("✅ I've Paid — Verify", callback_data=f"verifypay_{payment['id']}")],
             ])
             await update.message.reply_text(
                 f"🚀 *Go Premium — GHS {PREMIUM_PRICE_CEDIS}*\n"
                 f"Reference: `{payment['id']}`\n\n"
-                f"Tap below to pay securely via Paystack. This link is unique to this request — "
-                f"your free-tier bot limit is lifted automatically once payment clears.",
+                f"Tap *Pay Now* to pay securely via Paystack, then tap *I've Paid — Verify* "
+                f"to confirm right away — your bot limit lifts the moment it's confirmed.",
                 parse_mode="Markdown", reply_markup=pay_kb
             )
         else:
@@ -1031,6 +1037,51 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception as e:
                 logging.error(f"Admin payment alert failed: {e}")
+        return
+
+    # SELF-SERVE PAYMENT VERIFICATION ("I've Paid — Verify")
+    if data.startswith("verifypay_"):
+        pid = data.split("_", 1)[1]
+        await query.answer("🔍 Verifying…")
+        payments = load_json(PAYMENTS_FILE)
+        p = payments.get(pid)
+        if not p:
+            await query.message.reply_text("⚠️ Payment reference not found.")
+            return
+        if p.get("uid") != uid:
+            await query.message.reply_text("⚠️ This payment doesn't belong to your account.")
+            return
+        if p.get("status") == "confirmed":
+            await query.message.reply_text("✅ Already confirmed — you're all set!")
+            return
+        if not PAYSTACK_SECRET:
+            await query.message.reply_text("⚠️ Online verification isn't configured. Please wait for admin confirmation.")
+            return
+        verified = await verify_paystack_payment(pid)
+        if not verified:
+            retry_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Try Again", callback_data=f"verifypay_{pid}")]])
+            await query.message.reply_text(
+                "❌ Payment not confirmed yet.\nIf you've just paid, wait a few seconds and tap Try Again.",
+                reply_markup=retry_kb
+            )
+            return
+        purpose = confirm_payment(pid)
+        if purpose == "premium":
+            await query.message.reply_text(
+                "🎉 *Payment confirmed!*\nYou're Premium now — your bot listing limit is removed.",
+                parse_mode="Markdown"
+            )
+        else:
+            await query.message.reply_text(
+                f"🎉 *Payment confirmed!*\nYour listing is now featured for {FEATURED_DAYS} days.",
+                parse_mode="Markdown"
+            )
+        await log_event(ctx, f"💰 *Payment confirmed (self-serve)*: `{pid}` by `{uid}`")
+        if ADMIN_ID:
+            try:
+                await ctx.bot.send_message(ADMIN_ID, f"💰 Payment self-verified\nRef: {pid}\nUser: {uid}\nPurpose: {purpose}")
+            except Exception as e:
+                logging.warning(f"Admin self-verify alert failed: {e}")
         return
 
     # MY LISTINGS
