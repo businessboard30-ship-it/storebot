@@ -13,6 +13,7 @@
 
 import os
 import json
+import html
 import logging
 import random
 import uuid
@@ -390,6 +391,8 @@ async def run_payment_flow(query, ctx: ContextTypes.DEFAULT_TYPE, uid: int,
     """One-tap payment flow, no email prompt, no 'request created' text:
     tap -> '⏳ Generating your payment link…' -> Pay Now + Verify card.
     `label` is the human title shown on the card, e.g. 'Get Featured' / 'Go Premium'.
+    Uses HTML parse mode (not Markdown) so a stray listing title can never
+    break message rendering the way a raw underscore did before.
     """
     await query.answer()
     await query.edit_message_text("⏳ Generating your payment link…")
@@ -399,12 +402,22 @@ async def run_payment_flow(query, ctx: ContextTypes.DEFAULT_TYPE, uid: int,
             [InlineKeyboardButton(f"💳 Pay GHS {price}", url=payment["checkout_url"])],
             [InlineKeyboardButton("✅ I've Paid — Verify", callback_data=f"verifypay_{payment['id']}")],
         ])
-        await query.message.reply_text(
-            f"🛒 {label}\n\n"
-            f"Tap Pay to complete payment securely via Paystack.\n"
-            f"Then tap I've Paid — Verify to confirm. 🎉",
-            reply_markup=pay_kb
+        if purpose == "premium":
+            detail = f"Removes the {FREE_BOT_LIMIT}-bot free limit — forever, one-time payment."
+        else:
+            l = get_listing(lid) if lid else None
+            title = html.escape(l["title"]) if l else "your listing"
+            detail = f"Boosts <b>{title}</b> to the top for {FEATURED_DAYS} days."
+        card = (
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🛒 <b>{html.escape(label)}</b>\n\n"
+            f"{detail}\n"
+            f"💰 Amount: <b>GHS {price}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Tap <b>Pay</b> to complete payment securely via Paystack.\n"
+            f"Then tap <b>I've Paid — Verify</b> to confirm. 🎉"
         )
+        await query.message.reply_text(card, parse_mode="HTML", reply_markup=pay_kb)
     else:
         reason = payment.get("init_error") or "Unknown error"
         await query.message.reply_text("⚠️ Payment setup failed. Please try again in a moment.")
@@ -1036,6 +1049,31 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ADMIN: manual payment confirmation
 # ════════════════════════════════════════════════════════════════════════════
 
+async def cmd_envcheck(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin-only: shows which required env vars this RUNNING process actually
+    sees (masked), so you can tell a Railway variable typo/missing-redeploy
+    apart from a real Paystack rejection without digging through logs."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    def mask(v):
+        if not v:
+            return "❌ NOT SET"
+        return f"✅ set ({v[:6]}…{v[-4:]}, {len(v)} chars)" if len(v) > 12 else "✅ set (short value)"
+    lines = [
+        "🔧 *Environment check* (this running deployment):",
+        f"TELEGRAM_TOKEN: {mask(os.environ.get('TELEGRAM_TOKEN'))}",
+        f"ADMIN_ID: {'✅ set (' + str(ADMIN_ID) + ')' if ADMIN_ID else '❌ NOT SET'}",
+        f"PAYSTACK_SECRET: {mask(PAYSTACK_SECRET)}",
+        f"PAYMENT_RECEIPT_EMAIL: {'✅ ' + PAYMENT_RECEIPT_EMAIL}",
+        f"LOG_GROUP_ID: {'✅ set' if LOG_GROUP_ID else '❌ NOT SET'}",
+    ]
+    lines.append(
+        "\nIf PAYSTACK_SECRET shows NOT SET here but you *do* see it in Railway "
+        "Variables, the running container just hasn't picked it up yet — trigger "
+        "a fresh redeploy (Railway only injects vars set *before* the deploy starts)."
+    )
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
 async def cmd_confirmpay(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
@@ -1115,6 +1153,7 @@ def main():
     app.add_handler(CommandHandler("support", cmd_support))
     app.add_handler(CommandHandler("getchatid", cmd_getchatid))
     app.add_handler(CommandHandler("confirmpay", cmd_confirmpay))
+    app.add_handler(CommandHandler("envcheck", cmd_envcheck))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
