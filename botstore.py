@@ -389,8 +389,8 @@ def confirm_payment(pid: str) -> Optional[str]:
 async def run_payment_flow(query, ctx: ContextTypes.DEFAULT_TYPE, uid: int,
                              lid: Optional[str], purpose: str, price: int, label: str):
     """One-tap payment flow, no email prompt, no 'request created' text:
-    tap -> '⏳ Generating your payment link…' -> Pay Now + Verify card.
-    `label` is the human title shown on the card, e.g. 'Get Featured' / 'Go Premium'.
+    tap -> '⏳ Generating your payment link…' -> Pay + Verify + Back card.
+    `label` is the human title shown on the card, e.g. 'VIP Membership' / 'Go Premium'.
     Uses HTML parse mode (not Markdown) so a stray listing title can never
     break message rendering the way a raw underscore did before.
     """
@@ -398,24 +398,15 @@ async def run_payment_flow(query, ctx: ContextTypes.DEFAULT_TYPE, uid: int,
     await query.edit_message_text("⏳ Generating your payment link…")
     payment = await create_payment_request(uid, lid, email=PAYMENT_RECEIPT_EMAIL, purpose=purpose)
     if payment.get("checkout_url"):
+        back_cb = "feature_info" if purpose == "feature" else "home"
         pay_kb = InlineKeyboardMarkup([
             [InlineKeyboardButton(f"💳 Pay GHS {price}", url=payment["checkout_url"])],
             [InlineKeyboardButton("✅ I've Paid — Verify", callback_data=f"verifypay_{payment['id']}")],
+            [InlineKeyboardButton("◀ Back", callback_data=back_cb)],
         ])
-        if purpose == "premium":
-            detail = f"Removes the {FREE_BOT_LIMIT}-bot free limit — forever, one-time payment."
-        else:
-            l = get_listing(lid) if lid else None
-            title = html.escape(l["title"]) if l else "your listing"
-            detail = f"Boosts <b>{title}</b> to the top for {FEATURED_DAYS} days."
         card = (
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🛒 <b>{html.escape(label)}</b>\n\n"
-            f"{detail}\n"
-            f"💰 Amount: <b>GHS {price}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"Tap <b>Pay</b> to complete payment securely via Paystack.\n"
-            f"Then tap <b>I've Paid — Verify</b> to confirm. 🎉"
+            f"👑 <b>{html.escape(label)} — GHS {price}</b>\n\n"
+            f"Tap the button below to complete your payment securely via Paystack 👇"
         )
         await query.message.reply_text(card, parse_mode="HTML", reply_markup=pay_kb)
     else:
