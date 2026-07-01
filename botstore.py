@@ -44,7 +44,7 @@ PAYSTACK_SECRET = os.environ.get("PAYSTACK_SECRET")  # not live yet — manual f
 LOG_GROUP_ID = int(os.environ.get("LOG_GROUP_ID", "0")) or None   # records: listings, payments, ratings, clicks
 DEV_GROUP_ID = int(os.environ.get("DEV_GROUP_ID", "0")) or None  # developer contribution group
 
-FEATURED_PRICE_CEDIS = 500
+FEATURED_PRICE_CEDIS = 20
 FEATURED_DAYS = 30  # default tier; multi-tier can be added later
 
 PREMIUM_PRICE_CEDIS = 500   # one-time payment to remove the free listing cap
@@ -526,27 +526,23 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not lid or "@" not in text:
             await update.message.reply_text("That doesn't look like a valid email. Please try again from My Listings.")
             return
+        generating_msg = await update.message.reply_text("⏳ Generating your payment link…")
         payment = await create_payment_request(uid, lid, email=text, purpose="feature")
+        await generating_msg.delete()
         if payment.get("checkout_url"):
             pay_kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("💳 Pay Now", url=payment["checkout_url"])],
                 [InlineKeyboardButton("✅ I've Paid — Verify", callback_data=f"verifypay_{payment['id']}")],
             ])
             await update.message.reply_text(
-                f"👑 *Get Featured — GHS {FEATURED_PRICE_CEDIS}*\n"
-                f"Reference: `{payment['id']}`\n\n"
-                f"Tap *Pay Now* to pay securely via Paystack, then tap *I've Paid — Verify* "
-                f"to confirm right away — no need to wait on us.",
+                f"👑 *Get Featured — GHS {FEATURED_PRICE_CEDIS}*\n\n"
+                f"Tap *Pay Now* to complete payment securely via Paystack.\n"
+                f"Then tap *I've Paid — Verify* to confirm. 🎉",
                 parse_mode="Markdown", reply_markup=pay_kb
             )
         else:
             reason = payment.get("init_error") or "Unknown error"
-            await update.message.reply_text(
-                f"👑 *Feature Request Created*\nReference: `{payment['id']}`\n\n"
-                f"⚠️ Online checkout couldn't be started: _{esc(reason)}_\n"
-                f"Contact the admin with this reference to complete payment manually.",
-                parse_mode="Markdown"
-            )
+            await update.message.reply_text("⚠️ Payment setup failed. Please try again in a moment.")
             if ADMIN_ID:
                 try:
                     await ctx.bot.send_message(
@@ -564,27 +560,23 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if "@" not in text:
             await update.message.reply_text("That doesn't look like a valid email. Please try again with 🚀 Go Premium.")
             return
+        generating_msg = await update.message.reply_text("⏳ Generating your payment link…")
         payment = await create_payment_request(uid, None, email=text, purpose="premium")
+        await generating_msg.delete()
         if payment.get("checkout_url"):
             pay_kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("💳 Pay Now", url=payment["checkout_url"])],
                 [InlineKeyboardButton("✅ I've Paid — Verify", callback_data=f"verifypay_{payment['id']}")],
             ])
             await update.message.reply_text(
-                f"🚀 *Go Premium — GHS {PREMIUM_PRICE_CEDIS}*\n"
-                f"Reference: `{payment['id']}`\n\n"
-                f"Tap *Pay Now* to pay securely via Paystack, then tap *I've Paid — Verify* "
-                f"to confirm right away — your bot limit lifts the moment it's confirmed.",
+                f"🚀 *Go Premium — GHS {PREMIUM_PRICE_CEDIS}*\n\n"
+                f"Tap *Pay Now* to complete payment securely via Paystack.\n"
+                f"Then tap *I've Paid — Verify* to confirm. 🎉",
                 parse_mode="Markdown", reply_markup=pay_kb
             )
         else:
             reason = payment.get("init_error") or "Unknown error"
-            await update.message.reply_text(
-                f"🚀 *Premium Upgrade Requested*\nReference: `{payment['id']}`\n\n"
-                f"⚠️ Online checkout couldn't be started: _{esc(reason)}_\n"
-                f"Contact the admin with this reference to complete payment manually.",
-                parse_mode="Markdown"
-            )
+            await update.message.reply_text("⚠️ Payment setup failed. Please try again in a moment.")
             if ADMIN_ID:
                 try:
                     await ctx.bot.send_message(
